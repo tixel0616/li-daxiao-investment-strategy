@@ -81,7 +81,8 @@ def fetch_index_quotes() -> dict[str, dict]:
             "name": fields[1],
             "price": _f(3),
             "pe_ttm": _f(39),
-            "pb": _f(46),
+            "pb": _f(43),
+            "change_pct": _f(32),
             "mcap_yi": _f(45),
         }
     return result
@@ -112,6 +113,26 @@ def fetch_limit_up_stats(date: str | None = None) -> dict:
         result["zbr"] = round(result["zb"] / result["zt"] * 100, 1)
     return result
 
+
+# ═══════════════════════════════════════════════════════════
+# 2.5 自动数据：腾讯财经 → 国债 ETF（511010）价格趋势
+# ═══════════════════════════════════════════════════════════
+
+def fetch_bond_etf() -> dict:
+    """返回国债 ETF 价格、涨跌幅（proxy for 债券市场趋势）"""
+    url = "https://qt.gtimg.cn/q=sh511010"
+    raw = _get(url, timeout=10, encoding="gbk")
+    for line in raw.strip().splitlines():
+        if '="' not in line: continue
+        body = line.split('"')[1]; f = body.split("~")
+        try:
+            return {
+                "name": f[1], "price": float(f[3]),
+                "change_pct": float(f[32]), "pre_close": float(f[4]),
+            }
+        except: pass
+    return {}
+
 # ═══════════════════════════════════════════════════════════
 # 4. 评分函数
 # ═══════════════════════════════════════════════════════════
@@ -123,6 +144,52 @@ def score_valuation(pe: float | None) -> int:
     if pe < 13: return 1
     if pe <= 16: return 0
     if pe <= 20: return -1
+    return -2
+
+def score_bond(bond: dict) -> int:
+    """国债 ETF 近5日趋势 → -2~+2（涨=收益率降=流动性松）"""
+    if not bond or not bond.get("price"): return 0
+    chg = bond.get("change_pct", 0)
+    if chg > 0.5: return 2
+    if chg > 0.2: return 1
+    if chg > -0.2: return 0
+    if chg > -0.5: return -1
+    return -2
+
+def sentiment_from_breadth(hs300_chg: float | None, ups: int, total: int) -> int:
+    """用广度+指数涨跌幅代理情绪（替代已失效的东财 push2ex）→ -2~+2"""
+    if total == 0:
+        return 0
+    ratio = ups / total
+    chg = hs300_chg or 0
+    s = 0
+    # 广度: 多数涨→恐慌/见底, 多数跌→狂热/追高需要区分
+    if ratio <= 0.2:
+        s -= 1  # 普跌, 可能恐慌
+    elif ratio >= 0.8:
+        s += 1  # 普涨, 可能修复情绪
+    # 幅度: 大跌→恐慌, 大涨→过热
+    if chg < -2:
+        s += 1  # 急跌后恐慌见底信号
+    elif chg < -0.5:
+        s += 0
+    elif chg > 2:
+        s -= 1  # 急涨→过热
+    elif chg > 0.5:
+        s += 1  # 温和上涨
+    return max(-2, min(2, s))
+
+def score_breadth(indices: dict) -> int:
+    """大盘涨跌 → -2~+2（正=多数指数上涨）"""
+    if not indices: return 0
+    ups = sum(1 for v in indices.values() if v and (v.get("change_pct") or 0) > 0)
+    total = len(indices)
+    if total == 0: return 0
+    ratio = ups / total
+    if ratio > 0.8: return 2
+    if ratio > 0.6: return 1
+    if ratio > 0.4: return 0
+    if ratio > 0.2: return -1
     return -2
 
 def score_sentiment(lu: dict) -> int:
@@ -137,16 +204,32 @@ def score_sentiment(lu: dict) -> int:
         elif zbr < 20: s += 1
     return max(-2, min(2, s))
 
+
+# ═══════════════════════════════════════════════════════════
+# 2.6 自动数据：东财 push2 → 大盘涨跌
+# ═══════════════════════════════════════════════════════════
+
+def derive_breadth(quotes: dict[str, dict]) -> dict[str, dict]:
+    """从腾讯指数行情提取涨跌 → {code: {name, change_pct}}"""
+    result = {}
+    for code, q in quotes.items():
+        chg = q.get("change_pct")
+        if chg is not None:
+            short = code.replace("sh", "").replace("sz", "")
+            result[short] = {
+                "name": q.get("name", ""),
+                "change_pct": chg,
+            }
+    return result
+
 # ═══════════════════════════════════════════════════════════
 # 5. 交互输入
 # ═══════════════════════════════════════════════════════════
 
 MANUAL_DIMS = {
-    "股债性价比": "股息率 vs 10Y国债收益率 → -2~+2（正=股优于债）",
     "盈利与信用": "盈利增速/信用利差/社融 → -2~+2（正=盈利改善/信用宽）",
     "货币流动性": "利率/LPR/降准降息/汇率 → -2~+2（正=流动性偏松）",
     "政策与制度": "政策落地 vs 价格反映阶段 → -2~+2（正=积极）",
-    "市场供求":   "IPO节奏/解禁/减持/回购 → -2~+2（正=供给少/回购多）",
     "长期资金":   "北向/两融/险资/社保动向 → -2~+2（正=持续流入）",
 }
 
@@ -188,22 +271,43 @@ def run(interactive: bool = True) -> dict:
     val_score = score_valuation(pe_300)
     print(f"  沪深300 PE={pe_300} PB={pb_300} → 得分 {val_score:+d}")
 
+    # ── 自动：股债 ──
+    print("[auto] 拉取国债 ETF（511010）趋势...") 
+    bond = fetch_bond_etf()
+    bond_score = score_bond(bond)
+    print(f"  国债ETF={bond.get('price')} 涨跌={bond.get('change_pct')}% → 得分 {bond_score:+d}")
+
+    # ── 自动：大盘涨跌 ──
+    print("[auto] 计算大盘涨跌（腾讯指数行情）...")
+    breadth = derive_breadth(quotes)
+    br_score = score_breadth(breadth)
+    ups_b = sum(1 for v in breadth.values() if (v.get("change_pct") or 0) > 0)
+    print(f"  主要指数 {ups_b}/{len(breadth)} 上涨 → 得分 {br_score:+d}")
+
     # ── 自动：情绪 ──
     print("[auto] 拉取涨停/炸板统计（东财 push2ex）...")
     lu = fetch_limit_up_stats()
-    se_score = score_sentiment(lu)
-    print(f"  涨停={lu['zt']} 炸板={lu['zb']} 跌停={lu['dt']} 炸板率={lu['zbr']}% → 得分 {se_score:+d}")
+    if lu["zt"] == 0 and lu["zb"] == 0:
+        # push2ex 不可用 → 用广度+涨跌幅代理
+        hs300_chg = quotes.get("sh000300", {}).get("change_pct")
+        se_score = sentiment_from_breadth(hs300_chg, ups_b, len(breadth))
+        lu["_fallback"] = True
+        print(f"  涨停 API 无数据，改用广度代理 → 得分 {se_score:+d}")
+    else:
+        se_score = score_sentiment(lu)
+        lu["_fallback"] = False
+        print(f"  涨停={lu['zt']} 炸板={lu['zb']} 跌停={lu['dt']} 炸板率={lu['zbr']}% → 得分 {se_score:+d}")
 
     # ── 手动：其余 ──
     manual = manual_scores() if interactive else {k: 0 for k in MANUAL_DIMS}
 
     scores = {
         "估值":        (val_score, "auto"),
-        "股债性价比":  (manual["股债性价比"], "manual"),
+        "股债性价比":  (bond_score, "auto"),
         "盈利与信用":  (manual["盈利与信用"], "manual"),
         "货币流动性":  (manual["货币流动性"], "manual"),
         "政策与制度":  (manual["政策与制度"], "manual"),
-        "市场供求":    (manual["市场供求"], "manual"),
+        "市场供求":    (br_score, "auto"),
         "长期资金":    (manual["长期资金"], "manual"),
         "情绪与结构":  (se_score, "auto"),
     }
@@ -225,6 +329,8 @@ def run(interactive: bool = True) -> dict:
         "details": {
             "hs300_pe": pe_300, "hs300_pb": pb_300,
             "limit_up": lu,
+            "bond_etf": bond,
+            "breadth": breadth,
             "index_quotes": {k: v.get("pe_ttm") for k, v in quotes.items() if "sh" in k or "sz" in k},
         }
     }
@@ -262,7 +368,9 @@ def print_report(result: dict) -> None:
 
   数据截止：{r['date']}
   沪深300 PE={d['hs300_pe']}  PB={d['hs300_pb']}
+  国债ETF {d['bond_etf'].get('price')} 涨跌 {d['bond_etf'].get('change_pct')}%
   涨停 {lu['zt']} 家 / 炸板 {lu['zb']} / 跌停 {lu['dt']} / 炸板率 {lu['zbr']}%
+  大盘上涨 {sum(1 for v in d['breadth'].values() if v.get('change_pct',0)>0)}/{len(d['breadth'])} 家
 """)
 
 
